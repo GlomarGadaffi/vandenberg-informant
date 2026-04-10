@@ -28,6 +28,7 @@ Environment:
 
 import argparse
 import base64
+import collections
 import json
 import os
 import traceback
@@ -35,11 +36,12 @@ import signal
 import sys
 import time
 from datetime import datetime, timezone
-from queue import Queue, Empty
-from threading import Thread, Event
+from queue import Queue, Empty, Full
+from threading import Thread, Event, Lock
 from typing import Optional
 
 import paho.mqtt.client as mqtt
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from google.cloud import bigquery
 from google.protobuf.json_format import MessageToDict
 
@@ -51,6 +53,9 @@ from meshtastic.protobuf import (
     telemetry_pb2,
 )
 
+
+# --- Logging ---
+
 def log_json(level, msg, **kwargs):
     ctx = {"level": level, "msg": str(msg), "ts": datetime.now(timezone.utc).isoformat()}
     if kwargs.pop("exc_info", False):
@@ -59,7 +64,8 @@ def log_json(level, msg, **kwargs):
         ctx.update(kwargs)
     print(json.dumps(ctx, default=str), flush=True)
 
-class GlomarLogger:
+
+class MeshNarcLogger:
     def __init__(self, verbose=False):
         self.verbose = verbose
     def info(self, msg, **kwargs):
@@ -72,11 +78,17 @@ class GlomarLogger:
         if self.verbose:
             log_json("DEBUG", msg, **kwargs)
 
-log = GlomarLogger()
+log = MeshNarcLogger()
+
+
+# --- Crypto ---
 
 # Meshtastic default channel key: AQ== (0x01), expanded to AES-256
 # The firmware expands 1-byte keys by repeating: 0x01 * 32
 DEFAULT_KEY = bytes([0x01] * 32)
+
+# Valid portnum range — anything outside this means decrypt produced garbage
+_VALID_PORTNUMS = set(portnums_pb2.PortNum.values())
 
 
 def decrypt_packet(mp: mesh_pb2.MeshPacket, key: bytes = DEFAULT_KEY) -> Optional[bytes]:
@@ -93,12 +105,10 @@ def decrypt_packet(mp: mesh_pb2.MeshPacket, key: bytes = DEFAULT_KEY) -> Optiona
         return None
 
     try:
-        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-
         # Build nonce: packet_id (4 LE) + from_node (4 LE) + 8 zero bytes
         nonce = (
             mp.id.to_bytes(4, "little")
-            + mp.from_.to_bytes(4, "little")  # `from` is reserved, protobuf uses `from_`
+            + mp.from_.to_bytes(4, "little")
             + b"\x00" * 8
         )
 
@@ -111,6 +121,33 @@ def decrypt_packet(mp: mesh_pb2.MeshPacket, key: bytes = DEFAULT_KEY) -> Optiona
         return None
 
 
+def try_decrypt_and_parse(
+    mp: mesh_pb2.MeshPacket, keys: dict[int, bytes]
+) -> Optional[mesh_pb2.Data]:
+    """Try each key, validate the decrypted protobuf is sane.
+
+    AES-CTR never "fails" on wrong keys — it just produces garbage.
+    We validate by checking that the parsed Data has a known portnum.
+    """
+    for key in keys.values():
+        raw = decrypt_packet(mp, key)
+        if not raw:
+            continue
+
+        try:
+            data = mesh_pb2.Data()
+            data.ParseFromString(raw)
+            # Sanity: portnum must be a valid enum value and payload non-empty
+            if data.portnum in _VALID_PORTNUMS and data.portnum != 0:
+                return data
+        except Exception:
+            continue
+
+    return None
+
+
+# --- Decode ---
+
 def decode_data(port_num: int, payload: bytes) -> dict:
     """Decode a Meshtastic Data payload based on port number."""
     result = {}
@@ -122,8 +159,7 @@ def decode_data(port_num: int, payload: bytes) -> dict:
         elif port_num == portnums_pb2.POSITION_APP:
             pos = mesh_pb2.Position()
             pos.ParseFromString(payload)
-            d = MessageToDict(pos, preserving_proto_field_name=True)
-            result = d
+            result = MessageToDict(pos, preserving_proto_field_name=True)
 
         elif port_num == portnums_pb2.NODEINFO_APP:
             user = mesh_pb2.User()
@@ -146,7 +182,6 @@ def decode_data(port_num: int, payload: bytes) -> dict:
             result = MessageToDict(route, preserving_proto_field_name=True)
 
         elif port_num == portnums_pb2.MAP_REPORT_APP:
-            # MapReport is available in newer protobuf versions
             try:
                 mr = mesh_pb2.MapReport()
                 mr.ParseFromString(payload)
@@ -183,6 +218,33 @@ def node_id_hex(num: int) -> str:
     return f"!{num:08x}"
 
 
+# --- Dedup ---
+
+class PacketDedup:
+    """Bounded dedup set — remembers recent packet fingerprints.
+
+    Meshtastic gateways can publish the same packet multiple times
+    (rebroadcasts heard by the same gateway). We dedup on (packet_id, from_id)
+    with a bounded window so memory doesn't grow unbounded.
+    """
+
+    def __init__(self, maxlen: int = 10000):
+        self._seen: collections.OrderedDict = collections.OrderedDict()
+        self._maxlen = maxlen
+
+    def is_dup(self, packet_id: int, from_id: int) -> bool:
+        key = (packet_id, from_id)
+        if key in self._seen:
+            return True
+        self._seen[key] = None
+        # Evict oldest if over capacity
+        while len(self._seen) > self._maxlen:
+            self._seen.popitem(last=False)
+        return False
+
+
+# --- Subscriber ---
+
 class MeshNarcSubscriber:
     """MQTT subscriber that decodes Meshtastic packets and inserts to BigQuery."""
 
@@ -190,12 +252,27 @@ class MeshNarcSubscriber:
         self.args = args
         self.shutdown = Event()
         self.packet_queue: Queue = Queue(maxsize=50000)
-        self.node_db: dict = {}  # node_num -> {longName, shortName}
+        self._writer_thread: Optional[Thread] = None
+
+        # Thread-safe state
+        self._lock = Lock()
+        self._node_db: dict = {}  # node_num -> {longName, shortName}
+        self._stats = {
+            "received": 0,
+            "decoded": 0,
+            "decrypt_fail": 0,
+            "deduped": 0,
+            "queue_full": 0,
+            "ingested": 0,
+            "errors": 0,
+            "disconnects": 0,
+        }
+
+        self._dedup = PacketDedup()
 
         # Channel keys: index -> bytes
         # Default channel (index 0) uses the well-known key
         self.channel_keys = {0: DEFAULT_KEY}
-        # Add any additional keys from args
         if args.extra_keys:
             for spec in args.extra_keys:
                 idx, b64key = spec.split(":", 1)
@@ -206,13 +283,17 @@ class MeshNarcSubscriber:
                     raw = raw[:32]
                 self.channel_keys[int(idx)] = raw
 
-        self.stats = {
-            "received": 0,
-            "decoded": 0,
-            "decrypt_fail": 0,
-            "ingested": 0,
-            "errors": 0,
-        }
+        # Capture position — resolve once, not per-packet
+        self.capture_lat = (
+            args.lat
+            or float(os.environ.get("MESHNARC_CAPTURE_LAT", 0))
+            or None
+        )
+        self.capture_lon = (
+            args.lon
+            or float(os.environ.get("MESHNARC_CAPTURE_LON", 0))
+            or None
+        )
 
         # BQ setup
         project = args.project or os.environ.get("MESHNARC_PROJECT", "")
@@ -222,6 +303,23 @@ class MeshNarcSubscriber:
         dataset = args.dataset or "meshnarc"
         table = args.table or "packets"
         self.table_id = f"{project}.{dataset}.{table}"
+
+    def _inc(self, key: str, n: int = 1):
+        """Thread-safe stats increment."""
+        with self._lock:
+            self._stats[key] += n
+
+    def _get_stats(self) -> dict:
+        with self._lock:
+            return dict(self._stats)
+
+    def _update_node(self, node_num: int, long_name: str, short_name: str):
+        with self._lock:
+            self._node_db[node_num] = {"longName": long_name, "shortName": short_name}
+
+    def _get_node(self, node_num: int) -> dict:
+        with self._lock:
+            return self._node_db.get(node_num, {})
 
     def start(self):
         """Connect MQTT + BQ and run."""
@@ -261,28 +359,34 @@ class MeshNarcSubscriber:
         log.info(f"Connecting to MQTT broker: {broker}:{port}")
         self.mqtt.connect(broker, port, keepalive=60)
 
-        # Start BQ writer thread
-        writer = Thread(target=self._bq_writer, daemon=True, name="bq-writer")
-        writer.start()
+        # Start BQ writer thread — NOT daemon, we join it on shutdown
+        self._writer_thread = Thread(target=self._bq_writer, name="bq-writer")
+        self._writer_thread.start()
 
         # Signal handlers
         signal.signal(signal.SIGINT, self._handle_signal)
         signal.signal(signal.SIGTERM, self._handle_signal)
 
-        # MQTT loop (blocking, handles reconnect)
+        # MQTT loop (non-blocking, handles reconnect internally)
         self.mqtt.loop_start()
 
         # Stats loop
         while not self.shutdown.is_set():
             self.shutdown.wait(60)
+            s = self._get_stats()
+            with self._lock:
+                node_count = len(self._node_db)
             log.info(
-                f"stats: rx={self.stats['received']} "
-                f"decoded={self.stats['decoded']} "
-                f"decrypt_fail={self.stats['decrypt_fail']} "
-                f"ingested={self.stats['ingested']} "
-                f"errors={self.stats['errors']} "
+                f"stats: rx={s['received']} "
+                f"decoded={s['decoded']} "
+                f"decrypt_fail={s['decrypt_fail']} "
+                f"deduped={s['deduped']} "
+                f"queue_full={s['queue_full']} "
+                f"ingested={s['ingested']} "
+                f"errors={s['errors']} "
+                f"disconnects={s['disconnects']} "
                 f"queue={self.packet_queue.qsize()} "
-                f"nodes={len(self.node_db)}"
+                f"nodes={node_count}"
             )
 
     def _on_connect(self, client, userdata, flags, rc, properties=None):
@@ -291,11 +395,12 @@ class MeshNarcSubscriber:
         client.subscribe(topic)
 
     def _on_disconnect(self, client, userdata, flags, rc, properties=None):
+        self._inc("disconnects")
         log.warning(f"MQTT disconnected (rc={rc}), will reconnect...")
 
     def _on_message(self, client, userdata, msg):
         """Process an incoming MQTT message (Meshtastic ServiceEnvelope)."""
-        self.stats["received"] += 1
+        self._inc("received")
 
         try:
             # Parse ServiceEnvelope
@@ -306,32 +411,25 @@ class MeshNarcSubscriber:
             if not mp or mp.id == 0:
                 return
 
+            # Dedup — same packet heard via rebroadcast
+            if self._dedup.is_dup(mp.id, mp.from_):
+                self._inc("deduped")
+                return
+
             # Extract topic metadata
             # Topic format: msh/{region}/{channel_id}/e/{channel_name}/{gateway_id}
             topic_parts = msg.topic.split("/")
             channel_name = topic_parts[4] if len(topic_parts) > 4 else ""
             gateway_id = topic_parts[5] if len(topic_parts) > 5 else ""
 
-            # Try to decrypt if encrypted
-            data = mesh_pb2.Data()
+            # Decrypt / extract payload
+            data = None
             if mp.HasField("decoded"):
                 data = mp.decoded
             elif mp.encrypted:
-                # Try all known keys
-                decrypted = None
-                for key in self.channel_keys.values():
-                    decrypted = decrypt_packet(mp, key)
-                    if decrypted:
-                        break
-
-                if decrypted:
-                    try:
-                        data.ParseFromString(decrypted)
-                    except Exception:
-                        self.stats["decrypt_fail"] += 1
-                        return
-                else:
-                    self.stats["decrypt_fail"] += 1
+                data = try_decrypt_and_parse(mp, self.channel_keys)
+                if not data:
+                    self._inc("decrypt_fail")
                     return
             else:
                 return
@@ -342,27 +440,28 @@ class MeshNarcSubscriber:
 
             # Update node DB from NODEINFO
             if data.portnum == portnums_pb2.NODEINFO_APP:
-                self.node_db[mp.from_] = {
-                    "longName": payload_dict.get("long_name", ""),
-                    "shortName": payload_dict.get("short_name", ""),
-                }
+                self._update_node(
+                    mp.from_,
+                    payload_dict.get("long_name", ""),
+                    payload_dict.get("short_name", ""),
+                )
 
-            # Extract position if present
+            # Extract position if present — use `is not None` to handle 0-lat/lon
             lat, lon, alt, speed, sats, precision = (
                 None, None, None, None, None, None,
             )
             if data.portnum == portnums_pb2.POSITION_APP:
                 # Meshtastic stores lat/lon as int * 1e-7
-                lat_i = payload_dict.get("latitude_i", 0)
-                lon_i = payload_dict.get("longitude_i", 0)
-                if lat_i:
+                lat_i = payload_dict.get("latitude_i")
+                lon_i = payload_dict.get("longitude_i")
+                if lat_i is not None:
                     lat = lat_i / 1e7
-                if lon_i:
+                if lon_i is not None:
                     lon = lon_i / 1e7
-                # Some versions use float directly
-                if not lat and "latitude" in payload_dict:
+                # Some firmware versions use float directly
+                if lat is None and "latitude" in payload_dict:
                     lat = payload_dict["latitude"]
-                if not lon and "longitude" in payload_dict:
+                if lon is None and "longitude" in payload_dict:
                     lon = payload_dict["longitude"]
                 alt = payload_dict.get("altitude")
                 speed = payload_dict.get("ground_speed")
@@ -370,9 +469,7 @@ class MeshNarcSubscriber:
                 precision = payload_dict.get("precision_bits")
 
             # Build BQ row
-            node_info = self.node_db.get(mp.from_, {})
-            capture_lat = self.args.lat or float(os.environ.get("MESHNARC_CAPTURE_LAT", 0)) or None
-            capture_lon = self.args.lon or float(os.environ.get("MESHNARC_CAPTURE_LON", 0)) or None
+            node_info = self._get_node(mp.from_)
 
             row = {
                 "packet_id": mp.id,
@@ -404,12 +501,18 @@ class MeshNarcSubscriber:
                 "sats_in_view": sats,
                 "precision_bits": precision,
                 "capture_node_id": gateway_id,
-                "capture_lat": capture_lat,
-                "capture_lon": capture_lon,
+                "capture_lat": self.capture_lat,
+                "capture_lon": self.capture_lon,
             }
 
-            self.packet_queue.put_nowait(row)
-            self.stats["decoded"] += 1
+            try:
+                self.packet_queue.put_nowait(row)
+            except Full:
+                self._inc("queue_full")
+                log.warning("Packet queue full — dropping packet. BQ writer falling behind.")
+                return
+
+            self._inc("decoded")
 
             if self.args.verbose:
                 log.info(
@@ -421,7 +524,7 @@ class MeshNarcSubscriber:
 
         except Exception as e:
             log.error(f"Error processing MQTT message: {e}", exc_info=self.args.verbose)
-            self.stats["errors"] += 1
+            self._inc("errors")
 
     def _bq_writer(self):
         """Background thread: batch inserts rows to BigQuery."""
@@ -445,9 +548,16 @@ class MeshNarcSubscriber:
                 batch = []
                 last_flush = now
 
-        # Final flush on shutdown
+        # Drain remaining queue on shutdown
+        while not self.packet_queue.empty():
+            try:
+                batch.append(self.packet_queue.get_nowait())
+            except Empty:
+                break
         if batch:
             self._flush_batch(batch)
+
+        log.info("BQ writer thread exiting — all batches flushed")
 
     def _flush_batch(self, batch: list):
         """Insert a batch of rows to BigQuery."""
@@ -458,22 +568,29 @@ class MeshNarcSubscriber:
             errors = self.bq_client.insert_rows_json(self.table_id, batch)
             if errors:
                 log.error(f"BQ insert errors: {errors[:3]}")
-                self.stats["errors"] += len(errors)
-                self.stats["ingested"] += len(batch) - len(errors)
+                self._inc("errors", len(errors))
+                self._inc("ingested", len(batch) - len(errors))
             else:
-                self.stats["ingested"] += len(batch)
+                self._inc("ingested", len(batch))
                 log.debug(f"Flushed {len(batch)} rows to BQ")
         except Exception as e:
             log.error(f"BQ insert failed: {e}")
-            self.stats["errors"] += len(batch)
+            self._inc("errors", len(batch))
 
     def _handle_signal(self, signum, frame):
         log.info(f"Signal {signum}, shutting down...")
         self.shutdown.set()
         self.mqtt.loop_stop()
         self.mqtt.disconnect()
-        time.sleep(2)  # Let BQ writer flush
-        log.info(f"Final stats: {self.stats}")
+
+        # Wait for BQ writer to drain and exit cleanly
+        if self._writer_thread and self._writer_thread.is_alive():
+            log.info("Waiting for BQ writer to flush...")
+            self._writer_thread.join(timeout=15)
+            if self._writer_thread.is_alive():
+                log.warning("BQ writer didn't finish in time — some data may be lost")
+
+        log.info(f"Final stats: {self._get_stats()}")
         sys.exit(0)
 
 

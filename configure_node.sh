@@ -11,9 +11,9 @@ set -euo pipefail
 BROKER="${1:?Usage: $0 <broker> <user> <pass> [lat] [lon]}"
 USER="${2:?}"
 PASS="${3:?}"
-LAT="${4:-29.6516}"
-LON="${5:--82.3248}"
-ALT="${6:-30}"
+LAT="${4:-0.0000}"
+LON="${5:-0.0000}"
+ALT="${6:-0}"
 
 echo "=== meshnarc node configuration ==="
 echo "Broker: ${BROKER}"

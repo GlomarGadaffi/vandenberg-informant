@@ -18,8 +18,8 @@ Environment=MESHNARC_PROJECT=your-gcp-project
 Environment=MESHNARC_BROKER=your-broker.example.com
 Environment=MESHNARC_MQTT_USER=meshnarc
 Environment=MESHNARC_MQTT_PASS=changeme
-Environment=MESHNARC_CAPTURE_LAT=29.6516
-Environment=MESHNARC_CAPTURE_LON=-82.3248
+Environment=MESHNARC_CAPTURE_LAT=0.0000
+Environment=MESHNARC_CAPTURE_LON=0.0000
 
 # Hardening
 NoNewPrivileges=true
