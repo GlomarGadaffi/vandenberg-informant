@@ -1,6 +1,27 @@
 # meshnarc
 
-Passive Meshtastic packet capture to BigQuery via cellular MQTT gateway.
+Passive SIGINT platform for LoRa mesh networks. Silently captures all Meshtastic RF traffic via a field-deployable cellular sensor node and warehouses decoded packets in BigQuery for retrospective analysis.
+
+## What This Does
+
+A `CLIENT_MUTE` Meshtastic node receives every packet on the air but never transmits — invisible to the mesh. All captured traffic is uplinked over cellular (Hologram IoT SIM) to an MQTT broker, where a Python subscriber decodes the protobufs and streams structured records into BigQuery.
+
+The result is a queryable archive of every packet seen on the mesh: who transmitted, who they were talking to, what they said, where they were, and when.
+
+### Analytical Capabilities
+
+| Capability | How It Works |
+|---|---|
+| **Identity Resolution** | Node IDs are correlated with long/short names from `NODEINFO_APP` broadcasts. Over time, builds a complete roster of mesh participants. |
+| **Social Graph Mapping** | Every packet records `from_id` → `to_id`. Query patterns reveal who talks to whom, frequency of communication, and group structures. |
+| **Geospatial Tracking** | `POSITION_APP` packets yield GPS coordinates, altitude, ground speed, and satellite count. Builds movement track histories per node. |
+| **Message Interception** | `TEXT_MESSAGE_APP` payloads are decoded to plaintext. The default Meshtastic encryption key (`AQ==` / `0x01`) is well-known — most users never change it. |
+| **RF Fingerprinting** | RSSI and SNR per packet, combined with known capture-node position, enables distance estimation and signal propagation analysis. |
+| **Multi-Protocol Fusion** | Schema includes `source_protocol` field. Meshtastic today, MeshCore tomorrow — same analytical pipeline. |
+
+### Field Deployment Model
+
+The capture node is a self-contained cellular dead-drop. No WiFi, no wired connection, no physical access needed after placement. Power it, place it, forget it. Hologram IoT backhaul at ~$1-2/month per node. Multiple sensors across a metro area create a regional mesh surveillance network.
 
 ## Architecture
 
@@ -13,7 +34,7 @@ Passive Meshtastic packet capture to BigQuery via cellular MQTT gateway.
 │  │ (capture) │  │ NB-IoT     │ │
 │  └─────┬─────┘  └──────┬─────┘ │
 │        │  ESP32-S3      │       │
-│        │  Meshtastic    │       │
+│        │  CLIENT_MUTE   │       │
 │        │  MQTT Gateway  │       │
 │        └───────┬────────┘       │
 └────────────────┼────────────────┘
@@ -29,12 +50,11 @@ Passive Meshtastic packet capture to BigQuery via cellular MQTT gateway.
                  ▼
     ┌────────────────────────┐
     │  meshnarc-subscriber   │
-    │  (Python, runs on      │
-    │   server / GCP e2-micro│
-    │   instance / anywhere) │
+    │  (Python)              │
     │                        │
-    │  • MQTT subscribe      │
     │  • Protobuf decode     │
+    │  • AES-256-CTR decrypt │
+    │  • Identity correlation│
     │  • BQ streaming insert │
     └────────────┬───────────┘
                  │
@@ -43,16 +63,25 @@ Passive Meshtastic packet capture to BigQuery via cellular MQTT gateway.
          │   BigQuery    │
          │  meshnarc.    │
          │  packets      │
+         └───────┬───────┘
+                 │
+                 ▼
+         ┌───────────────┐
+         │  Analytical   │
+         │  Views        │
+         │  • recent_nodes│
+         │  • messages   │
+         │  • positions  │
          └───────────────┘
 ```
 
 ## Components
 
-1. **LilyGo T-SIM7080G-S3** — Meshtastic firmware, MQTT gateway mode
-2. **Hologram IoT SIM** — Cat-M1/NB-IoT cellular backhaul
+1. **LilyGo T-SIM7080G-S3** — Meshtastic firmware, `CLIENT_MUTE` role (receive-only, zero RF emissions)
+2. **Hologram IoT SIM** — Cat-M1/NB-IoT cellular backhaul, ~$1-2/month
 3. **MQTT Broker** — mosquitto (self-hosted) or HiveMQ Cloud (free tier)
-4. **meshnarc-subscriber** — Python daemon, decodes + inserts to BQ
-5. **BigQuery** — `meshnarc.packets` table
+4. **meshnarc-subscriber** — Python daemon: protobuf decode, AES decrypt, identity correlation, BQ ingest
+5. **BigQuery** — `meshnarc.packets` table with analytical views
 
 ## Setup
 
@@ -215,6 +244,67 @@ mosquitto_sub -h your-broker -u meshnarc -P password -t "msh/#" -v
 bq query 'SELECT * FROM meshnarc.packets ORDER BY rx_timestamp DESC LIMIT 10'
 ```
 
+## BigQuery Views
+
+The schema includes pre-built analytical views:
+
+### `meshnarc.recent_nodes` — Active Node Roster (24h)
+
+Who's on the air right now. Aggregates packet counts, signal quality, port types, and last-known position per node.
+
+```sql
+SELECT * FROM meshnarc.recent_nodes ORDER BY last_seen DESC;
+```
+
+### `meshnarc.messages` — Intercepted Text Messages
+
+All decoded `TEXT_MESSAGE_APP` content with sender identity, channel, and signal metadata.
+
+```sql
+SELECT rx_timestamp, from_long_name, message_text
+FROM meshnarc.messages
+WHERE rx_timestamp > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR);
+```
+
+### `meshnarc.positions` — GPS Track Histories
+
+Position reports with coordinates, altitude, speed, and satellite count. Feed into mapping tools for movement analysis.
+
+```sql
+-- Last known position for every node
+SELECT DISTINCT from_id, from_long_name, latitude, longitude
+FROM meshnarc.positions
+WHERE rx_timestamp > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR);
+```
+
+## Example Queries
+
+```sql
+-- Social graph: who talks to whom (last 7 days)
+SELECT from_id, to_id, COUNT(*) AS packet_count
+FROM meshnarc.packets
+WHERE rx_timestamp > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)
+  AND to_id != '!ffffffff'  -- exclude broadcasts
+GROUP BY from_id, to_id
+ORDER BY packet_count DESC;
+
+-- Movement history for a specific node
+SELECT rx_timestamp, latitude, longitude, altitude, ground_speed
+FROM meshnarc.positions
+WHERE from_id = '!aabbccdd'
+ORDER BY rx_timestamp;
+
+-- Signal quality by node (identify nearby vs distant stations)
+SELECT from_id, from_long_name,
+  COUNT(*) AS packets,
+  ROUND(AVG(rx_rssi), 1) AS avg_rssi,
+  ROUND(AVG(rx_snr), 1) AS avg_snr
+FROM meshnarc.packets
+WHERE rx_timestamp > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)
+GROUP BY from_id, from_long_name
+ORDER BY avg_rssi DESC;
+```
+
 ## MQTT Topic Structure
 
 Meshtastic publishes to topics like:
@@ -240,7 +330,8 @@ for MeshCore packet ingestion, but the capture path is different hardware.
 
 - **Hologram**: ~$0.40/month device fee + $0.60/MB data.
   MQTT packets are tiny (~100-300 bytes each). Even heavy mesh traffic
-  (1000 packets/day) is well under 1 MB/month. Budget ~$1-2/month.
+  (1000 packets/day) is well under 1 MB/month. Budget ~$1-2/month per node.
 - **HiveMQ Cloud**: Free tier sufficient.
 - **BigQuery**: Streaming inserts ~$0.01/200MB. Negligible at this scale.
   Storage: $0.02/GB/month. You'd need millions of packets to hit $1.
+- **Total**: A single-node deployment runs under $3/month. A multi-node metro deployment scales linearly.

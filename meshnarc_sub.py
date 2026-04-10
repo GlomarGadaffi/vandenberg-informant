@@ -5,7 +5,7 @@ meshnarc_sub.py — MQTT subscriber for Meshtastic packet capture to BigQuery.
 Subscribes to Meshtastic MQTT gateway topics, decodes ServiceEnvelope
 protobufs, and streams decoded packets to BigQuery.
 
-Designed to run on any host with internet access (glolab, Cloud Run Job, etc).
+Designed to run on any host with internet access (Compute Engine, Cloud Run Job, etc).
 The LilyGo T-SIM7080G-S3 handles RF capture and MQTT uplink over Hologram
 cellular — this subscriber just processes the stream.
 
