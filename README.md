@@ -30,7 +30,7 @@ Passive Meshtastic packet capture to BigQuery via cellular MQTT gateway.
     ┌────────────────────────┐
     │  meshnarc-subscriber   │
     │  (Python, runs on      │
-    │   glolab / GCP e2-micro│
+    │   server / GCP e2-micro│
     │   instance / anywhere) │
     │                        │
     │  • MQTT subscribe      │
@@ -97,7 +97,7 @@ meshtastic --ch-set psk "AQ==" --ch-index 0
 # meshtastic --ch-set uplink_enabled true --ch-index 1
 
 # Set fixed position (your capture site)
-meshtastic --setlat 29.6516 --setlon -82.3248 --setalt 30
+meshtastic --setlat 0.0000 --setlon 0.0000 --setalt 0
 
 # Power settings — keep alive
 meshtastic --set power.is_always_powered true
@@ -122,7 +122,7 @@ meshtastic --set power.is_always_powered true
 
 #### Option A: Self-hosted mosquitto (recommended)
 
-On glolab or any server:
+On your server:
 
 ```bash
 sudo apt install mosquitto mosquitto-clients
@@ -139,7 +139,7 @@ sudo mosquitto_passwd -c /etc/mosquitto/passwd meshnarc
 sudo systemctl restart mosquitto
 ```
 
-If glolab is on Tailscale, the LilyGo can't reach it directly (no
+If your server is on Tailscale, the LilyGo can't reach it directly (no
 Tailscale on ESP32). Options:
 - Expose mosquitto on a public IP with TLS + auth
 - Use a cloud-hosted broker instead
@@ -154,7 +154,7 @@ Tailscale on ESP32). Options:
 ### 5. Deploy meshnarc-subscriber
 
 ```bash
-# On glolab or any host
+# On your server or any host
 cd meshnarc
 pip install -r requirements.txt --break-system-packages
 
