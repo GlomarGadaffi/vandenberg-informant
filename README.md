@@ -1,4 +1,4 @@
-# vandenberg-informant
+# meshtap
 
 passive Meshtastic packet capture to BigQuery. hardware uplinks RF packets over Hologram cellular, subscriber decodes and streams to GCP. designed for long-term RF telemetry archival without node-level storage constraints.
 
